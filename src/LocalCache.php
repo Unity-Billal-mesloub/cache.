@@ -4,7 +4,8 @@ namespace Amp\Cache;
 
 use Amp\ForbidCloning;
 use Amp\ForbidSerialization;
-use Revolt\EventLoop;
+use Amp\Interval;
+use function Amp\weakClosure;
 
 /**
  * A cache which stores data in an in-memory (local) array.
@@ -20,9 +21,15 @@ final class LocalCache implements Cache, \Countable, \IteratorAggregate
     use ForbidCloning;
     use ForbidSerialization;
 
-    private readonly object $state;
+    /** @var array<TValue> */
+    private array $cache = [];
 
-    private readonly string $gcCallbackId;
+    /** @var array<int> */
+    private array $timeouts = [];
+
+    private bool $isSortNeeded = false;
+
+    private readonly Interval $gcInterval;
 
     /** @var int<1, max>|null */
     private readonly ?int $sizeLimit;
@@ -37,69 +44,45 @@ final class LocalCache implements Cache, \Countable, \IteratorAggregate
             throw new \Error('Invalid sizeLimit, must be > 0: ' . $sizeLimit);
         }
 
-        // By using a separate state object we're able to use `__destruct()` for garbage collection of both this
-        // instance and the event loop callback. Otherwise, this object could only be collected when the garbage
-        // collection callback was cancelled at the event loop layer.
-        $this->state = $state = new class {
-            public array $cache = [];
-
-            /** @var array<string, int> */
-            public array $cacheTimeouts = [];
-
-            public bool $isSortNeeded = false;
-
-            public function collectGarbage(): void
-            {
-                $now = \time();
-
-                if ($this->isSortNeeded) {
-                    \asort($this->cacheTimeouts);
-                    $this->isSortNeeded = false;
-                }
-
-                foreach ($this->cacheTimeouts as $key => $expiry) {
-                    if ($now <= $expiry) {
-                        break;
-                    }
-
-                    unset(
-                        $this->cache[$key],
-                        $this->cacheTimeouts[$key]
-                    );
-                }
-            }
-        };
-
-        $this->gcCallbackId = EventLoop::repeat($gcInterval, $state->collectGarbage(...));
         $this->sizeLimit = $sizeLimit;
 
-        EventLoop::unreference($this->gcCallbackId);
-    }
+        $this->gcInterval = new Interval($gcInterval, weakClosure(function (): void {
+            $now = \time();
 
-    public function __destruct()
-    {
-        $this->state->cache = [];
-        $this->state->cacheTimeouts = [];
+            if ($this->isSortNeeded) {
+                \asort($this->timeouts, \SORT_NUMERIC);
+                $this->isSortNeeded = false;
+            }
 
-        EventLoop::cancel($this->gcCallbackId);
+            foreach ($this->timeouts as $key => $expiry) {
+                if ($now <= $expiry) {
+                    break;
+                }
+
+                unset(
+                    $this->cache[$key],
+                    $this->timeouts[$key],
+                );
+            }
+        }), reference: false);
     }
 
     public function get(string $key): mixed
     {
-        if (!isset($this->state->cache[$key])) {
+        if (!isset($this->cache[$key])) {
             return null;
         }
 
-        $value = $this->state->cache[$key];
-        unset($this->state->cache[$key]);
+        $value = $this->cache[$key];
+        unset($this->cache[$key]);
 
-        if (isset($this->state->cacheTimeouts[$key]) && \time() > $this->state->cacheTimeouts[$key]) {
-            unset($this->state->cacheTimeouts[$key]);
+        if (isset($this->timeouts[$key]) && \time() > $this->timeouts[$key]) {
+            unset($this->timeouts[$key]);
 
             return null;
         }
 
-        $this->state->cache[$key] = $value;
+        $this->cache[$key] = $value;
 
         return $value;
     }
@@ -111,32 +94,32 @@ final class LocalCache implements Cache, \Countable, \IteratorAggregate
         }
 
         if ($ttl === null) {
-            unset($this->state->cacheTimeouts[$key]);
+            unset($this->timeouts[$key]);
         } elseif ($ttl >= 0) {
             $expiry = \time() + $ttl;
-            $this->state->cacheTimeouts[$key] = $expiry;
-            $this->state->isSortNeeded = true;
+            $this->timeouts[$key] = $expiry;
+            $this->isSortNeeded = true;
         } else {
             throw new \Error("Invalid cache TTL ({$ttl}; integer >= 0 or null required");
         }
 
-        unset($this->state->cache[$key]);
-        if (\count($this->state->cache) === $this->sizeLimit) {
+        unset($this->cache[$key]);
+        if (\count($this->cache) === $this->sizeLimit) {
             /** @var array-key $keyToEvict */
-            $keyToEvict = \array_key_first($this->state->cache);
-            unset($this->state->cache[$keyToEvict]);
+            $keyToEvict = \array_key_first($this->cache);
+            unset($this->cache[$keyToEvict]);
         }
 
-        $this->state->cache[$key] = $value;
+        $this->cache[$key] = $value;
     }
 
     public function delete(string $key): bool
     {
-        $exists = isset($this->state->cache[$key]);
+        $exists = isset($this->cache[$key]);
 
         unset(
-            $this->state->cache[$key],
-            $this->state->cacheTimeouts[$key]
+            $this->cache[$key],
+            $this->timeouts[$key],
         );
 
         return $exists;
@@ -144,12 +127,12 @@ final class LocalCache implements Cache, \Countable, \IteratorAggregate
 
     public function count(): int
     {
-        return \count($this->state->cache);
+        return \count($this->cache);
     }
 
     public function getIterator(): \Traversable
     {
-        foreach ($this->state->cache as $key => $value) {
+        foreach ($this->cache as $key => $value) {
             yield (string) $key => $value;
         }
     }
